@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Merge Nerd Font icon glyphs into the plain Ubuntu Mono variable font.
+"""Merge Nerd Font icon glyphs into a plain Ubuntu Mono font.
 
 The plain variable font (UbuntuMono[wght].ttf, family "Ubuntu Mono") has the
 modern look Christian wants. The Nerd Fonts build (UbuntuMonoNerdFontMono)
 patches an OLDER release of Ubuntu Mono, so its normal letters/digits differ
 visibly. Solution: copy ONLY the icon/symbol glyphs (plus their cmap entries)
-from the Nerd build into the plain variable font, preserving the plain font's
-outlines, metrics, and family name. Result: same plain look + full Nerd icons.
+from the Nerd build into the plain font, preserving the plain font's outlines
+and metrics. Result: same plain look + full Nerd icons.
 
-Usage: merge_nerd_icons.py <plain.ttf> <nerd.ttf> <output.ttf>
+Usage: merge_nerd_icons.py <plain.ttf> <nerd.ttf> <output.ttf> [weight]
 """
 
 import sys
@@ -38,9 +38,17 @@ def is_icon_codepoint(cp: int) -> bool:
     )
 
 
+def _set_name_record(rec, value: str) -> None:
+    """Write a name-table record using the record's own encoding."""
+    encoding = rec.getEncoding()
+    rec.string = value.encode(encoding) if encoding else value.encode()
+
+
 def main():
     plain_path, nerd_path, out_path = sys.argv[1:4]
     weight = int(sys.argv[4]) if len(sys.argv) > 4 else 400
+    style = "Bold" if weight >= 700 else "Regular"
+
     plain = TTFont(plain_path)
     nerd = TTFont(nerd_path)
 
@@ -100,11 +108,9 @@ def main():
 
     # The variable font's gvar table holds per-glyph variation deltas for the
     # ORIGINAL glyph set only. Adding glyphs without gvar entries breaks
-    # decompilation (gvar expects glyphCount entries). Simplest correct fix:
-    # strip gvar + fvar, making this a static 400-weight font. CSS serves it
-    # at any weight via the @font-face range, but rendering is always the
-    # default instance (400). The plain variable font's default IS 400, so
-    # the look is unchanged.
+    # decompilation (gvar expects glyphCount entries). The input is already
+    # instanced at the requested weight, so strip the remaining variation
+    # tables and keep this output as a static face at that weight.
     for tag in ("gvar", "fvar", "STAT", "MVAR", "cvar", "avar"):
         if tag in plain:
             del plain[tag]
@@ -138,36 +144,59 @@ def main():
             if cp not in table.cmap:
                 table.cmap[cp] = gn
 
-    # Rename the family so the merged font presents as "<Base> NF"
-    # (settings reference "Ubuntu Mono NF", not "Ubuntu Mono").
+    # Rename and fully style-link the family. Windows Terminal/DirectWrite
+    # uses several pieces of metadata when resolving ANSI bold. Setting only
+    # usWeightClass/macStyle is not enough: name IDs 2/17, fsSelection and
+    # unique/PostScript names must agree or Windows may synthesize/select the
+    # wrong face even when a real 700-weight TTF is installed.
     base_family = None
     for rec in plain["name"].names:
         if rec.nameID == 1 and rec.toUnicode():
             base_family = rec.toUnicode()
             break
+
     if base_family:
         nf_family = base_family + " NF"
-        nf_full = nf_family + " " + (plain["name"].getDebugName(2) or "Regular")
-        for rec in plain["name"].names:
-            if rec.nameID in (1, 16):
-                rec.string = nf_family.encode(rec.getEncoding()) if rec.getEncoding() else nf_family.encode()
-            elif rec.nameID == 4:
-                rec.string = nf_full.encode(rec.getEncoding()) if rec.getEncoding() else nf_full.encode()
-            elif rec.nameID == 6:
-                ps = (rec.toUnicode() or "").rsplit("-", 1)
-                base_ps = ps[0] if len(ps) > 1 else "UbuntuMono"
-                weight_suffix = ps[1] if len(ps) > 1 else "Regular"
-                rec.string = (base_ps + "-NF-" + weight_suffix).encode(rec.getEncoding()) if rec.getEncoding() else (base_ps + "-NF-" + weight_suffix).encode()
-        print("renamed family:", base_family, "->", nf_family)
+        nf_full = f"{nf_family} {style}"
+        ps_family = "".join(ch for ch in nf_family if ch.isalnum())
+        ps_name = f"{ps_family}-{style}"
+        unique_id = f"{nf_family};{style};{weight}"
 
-    # Set correct weight metadata (the instancer leaves usWeightClass at the
-    # variable font's default even when instanced at 700).
+        for rec in plain["name"].names:
+            if rec.nameID in (1, 16):          # family / typographic family
+                _set_name_record(rec, nf_family)
+            elif rec.nameID in (2, 17):        # subfamily / typographic subfamily
+                _set_name_record(rec, style)
+            elif rec.nameID == 3:              # unique font identifier
+                _set_name_record(rec, unique_id)
+            elif rec.nameID == 4:              # full font name
+                _set_name_record(rec, nf_full)
+            elif rec.nameID == 6:              # PostScript name
+                _set_name_record(rec, ps_name)
+
+        print("renamed family:", base_family, "->", nf_family)
+        print("style:", style)
+        print("PostScript name:", ps_name)
+
+    # Set weight/style metadata consistently for Windows, macOS and other
+    # font consumers.
     plain["OS/2"].usWeightClass = weight
+
+    # OS/2.fsSelection: bit 5 = BOLD, bit 6 = REGULAR. These are mutually
+    # exclusive for our two upright faces.
+    fs_selection = plain["OS/2"].fsSelection
     if weight >= 700:
-        plain["head"].macStyle |= 0x01  # bold bit
+        fs_selection |= 0x20
+        fs_selection &= ~0x40
+        plain["head"].macStyle |= 0x01
     else:
+        fs_selection &= ~0x20
+        fs_selection |= 0x40
         plain["head"].macStyle &= ~0x01
+    plain["OS/2"].fsSelection = fs_selection
+
     print("set usWeightClass:", weight)
+    print("set fsSelection:", hex(fs_selection))
 
     plain.save(out_path)
     print("saved:", out_path)
